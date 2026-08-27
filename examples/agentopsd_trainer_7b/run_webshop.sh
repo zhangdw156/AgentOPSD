@@ -98,6 +98,9 @@ if [[ "${LAUNCHER_DRY_RUN:-false}" == true ]]; then
     if (( $# > 0 )); then printf '%s\n' "$@"; fi
     exit 0
 fi
+
+bash "${REPO_ROOT}/scripts/bootstrap_webshop_data.sh"
+
 "${PYTHON_BIN}" -m examples.data_preprocess.prepare "${DATA_PREP_ARGS[@]}"
 "${PYTHON_BIN}" -m "${TRAINER_MODULE}" \
     "${ALGORITHM_ARGS[@]}" "${DATA_ARGS[@]}" "${MODEL_ARGS[@]}" \

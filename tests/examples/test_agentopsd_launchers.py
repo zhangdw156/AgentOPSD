@@ -1,4 +1,5 @@
 import os
+import shutil
 import subprocess
 from itertools import product
 from pathlib import Path
@@ -7,8 +8,15 @@ from hydra import compose, initialize_config_dir
 
 REPO_ROOT = Path(__file__).parents[2]
 EXAMPLES_ROOT = REPO_ROOT / "examples"
+WEBSHOP_BOOTSTRAP = REPO_ROOT / "scripts/bootstrap_webshop_data.sh"
 MODEL_SIZES = ("1.5b", "3b", "7b")
 BENCHMARKS = ("alfworld", "webshop")
+WEBSHOP_RESOURCES = (
+    "data/items_shuffle_1000.json",
+    "data/items_ins_v2_1000.json",
+    "data/items_human_ins.json",
+    "search_engine/indexes",
+)
 
 
 def _expected_launchers():
@@ -40,6 +48,57 @@ def _effective(arguments):
         if separator:
             effective[key.lstrip("+")] = value
     return effective
+
+
+def _webshop_launchers():
+    return sorted(
+        EXAMPLES_ROOT / f"agentopsd_trainer_{size}" / "run_webshop.sh"
+        for size in MODEL_SIZES
+    )
+
+
+def _python_stub(tmp_path):
+    tmp_path.mkdir(parents=True, exist_ok=True)
+    log_path = tmp_path / "python.log"
+    stub_path = tmp_path / "python3"
+    stub_path.write_text(
+        '#!/usr/bin/env bash\nprintf "%s\\n" "$*" >> "${PYTHON_LOG}"\n',
+        encoding="utf-8",
+    )
+    stub_path.chmod(0o755)
+    return stub_path, log_path
+
+
+def _run_webshop_launcher(
+    launcher,
+    *,
+    repo_root,
+    shared_root,
+    python_bin,
+    python_log,
+    dry_run=False,
+):
+    repo_root.mkdir(parents=True, exist_ok=True)
+    return subprocess.run(
+        [str(launcher)],
+        check=False,
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "LAUNCHER_DRY_RUN": "true" if dry_run else "false",
+            "PYTHON_BIN": str(python_bin),
+            "PYTHON_LOG": str(python_log),
+            "REPO_ROOT": str(REPO_ROOT),
+            "WEBSHOP_SHARED_ROOT": str(shared_root),
+            "WEBSHOP_LOCAL_ROOT": str(
+                repo_root
+                / "agent_system/environments/env_package/webshop/webshop"
+            ),
+        },
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
 
 
 def test_examples_contains_exactly_six_agentopsd_launchers():
@@ -237,6 +296,194 @@ def test_runtime_contracts_are_environment_specific():
         assert 'PYTHON_BIN="${PYTHON_BIN:-python3}"' in webshop
         assert "VERL_AGENT_RUNTIME_ROOT" not in webshop
         assert "GLIBC_SHIM" not in webshop
+
+
+def test_webshop_launchers_link_shared_resources_idempotently(tmp_path):
+    for launcher in _webshop_launchers():
+        case_root = tmp_path / launcher.parent.name
+        repo_root = case_root / "repo"
+        shared_root = case_root / "shared"
+        local_root = (
+            repo_root
+            / "agent_system/environments/env_package/webshop/webshop"
+        )
+        existing_path = local_root / "data/items_human_ins.json"
+        existing_path.parent.mkdir(parents=True)
+        existing_path.write_text("keep-local", encoding="utf-8")
+
+        for resource in WEBSHOP_RESOURCES:
+            if resource == "data/items_human_ins.json":
+                continue
+            source = shared_root / resource
+            if resource == "search_engine/indexes":
+                source.mkdir(parents=True)
+                (source / "segments_1").write_text("index", encoding="utf-8")
+            else:
+                source.parent.mkdir(parents=True, exist_ok=True)
+                source.write_text(resource, encoding="utf-8")
+
+        python_bin, python_log = _python_stub(case_root)
+        for _ in range(2):
+            completed = _run_webshop_launcher(
+                launcher,
+                repo_root=repo_root,
+                shared_root=shared_root,
+                python_bin=python_bin,
+                python_log=python_log,
+            )
+            assert completed.returncode == 0, completed.stderr
+
+        assert existing_path.read_text(encoding="utf-8") == "keep-local"
+        assert not existing_path.is_symlink()
+        for resource in WEBSHOP_RESOURCES:
+            local_path = local_root / resource
+            if local_path == existing_path:
+                continue
+            assert local_path.is_symlink()
+            assert local_path.resolve() == (shared_root / resource).resolve()
+        assert len(python_log.read_text(encoding="utf-8").splitlines()) == 4
+
+
+def test_webshop_launchers_fail_before_linking_when_shared_source_is_missing(
+    tmp_path,
+):
+    for launcher in _webshop_launchers():
+        case_root = tmp_path / launcher.parent.name
+        repo_root = case_root / "repo"
+        shared_root = case_root / "shared"
+        for resource in WEBSHOP_RESOURCES[:-1]:
+            source = shared_root / resource
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(resource, encoding="utf-8")
+
+        python_bin, python_log = _python_stub(case_root)
+        completed = _run_webshop_launcher(
+            launcher,
+            repo_root=repo_root,
+            shared_root=shared_root,
+            python_bin=python_bin,
+            python_log=python_log,
+        )
+
+        assert completed.returncode != 0
+        assert "Invalid shared WebShop index directory:" in completed.stderr
+        assert "Run the shared WebShop setup first:" in completed.stderr
+        assert "./setup.sh -d all" in completed.stderr
+        assert not (
+            repo_root
+            / "agent_system/environments/env_package/webshop/webshop"
+        ).exists()
+        assert not python_log.exists()
+
+
+def test_webshop_bootstrap_serializes_concurrent_launchers(tmp_path):
+    shared_root = tmp_path / "shared"
+    local_root = tmp_path / "clone/webshop"
+    for resource in WEBSHOP_RESOURCES:
+        source = shared_root / resource
+        if resource == "search_engine/indexes":
+            source.mkdir(parents=True)
+            (source / "segments_1").write_text("index", encoding="utf-8")
+        else:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(resource, encoding="utf-8")
+    environment = {
+        **os.environ,
+        "WEBSHOP_SHARED_ROOT": str(shared_root),
+        "WEBSHOP_LOCAL_ROOT": str(local_root),
+    }
+
+    processes = [
+        subprocess.Popen(
+            ["bash", str(WEBSHOP_BOOTSTRAP)],
+            cwd=REPO_ROOT,
+            env=environment,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        for _ in range(16)
+    ]
+    results = [process.communicate(timeout=20) + (process.returncode,) for process in processes]
+
+    assert all(returncode == 0 for _, _, returncode in results), results
+    for resource in WEBSHOP_RESOURCES:
+        local_path = local_root / resource
+        assert local_path.is_symlink()
+        assert local_path.resolve() == (shared_root / resource).resolve()
+
+
+def test_webshop_bootstrap_rolls_back_links_after_failure(tmp_path):
+    shared_root = tmp_path / "shared"
+    local_root = tmp_path / "clone/webshop"
+    bin_dir = tmp_path / "bin"
+    counter = tmp_path / "ln-count"
+    for resource in WEBSHOP_RESOURCES:
+        source = shared_root / resource
+        if resource == "search_engine/indexes":
+            source.mkdir(parents=True)
+            (source / "segments_1").write_text("index", encoding="utf-8")
+        else:
+            source.parent.mkdir(parents=True, exist_ok=True)
+            source.write_text(resource, encoding="utf-8")
+    bin_dir.mkdir()
+    ln_stub = bin_dir / "ln"
+    real_ln = shutil.which("ln")
+    assert real_ln is not None
+    ln_stub.write_text(
+        "#!/usr/bin/env bash\n"
+        'count="$(cat "${LN_COUNTER}" 2>/dev/null || printf 0)"\n'
+        "count=$((count + 1))\n"
+        'printf "%s\\n" "${count}" > "${LN_COUNTER}"\n'
+        'if (( count == 2 )); then exit 42; fi\n'
+        'exec "${REAL_LN}" "$@"\n',
+        encoding="utf-8",
+    )
+    ln_stub.chmod(0o755)
+
+    completed = subprocess.run(
+        ["bash", str(WEBSHOP_BOOTSTRAP)],
+        cwd=REPO_ROOT,
+        env={
+            **os.environ,
+            "PATH": f"{bin_dir}:{os.environ['PATH']}",
+            "LN_COUNTER": str(counter),
+            "REAL_LN": real_ln,
+            "WEBSHOP_SHARED_ROOT": str(shared_root),
+            "WEBSHOP_LOCAL_ROOT": str(local_root),
+        },
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+
+    assert completed.returncode == 42
+    assert not any((local_root / resource).is_symlink() for resource in WEBSHOP_RESOURCES)
+
+
+def test_webshop_launcher_dry_run_does_not_link_or_require_shared_resources(
+    tmp_path,
+):
+    for launcher in _webshop_launchers():
+        case_root = tmp_path / launcher.parent.name
+        repo_root = case_root / "repo"
+        python_bin, python_log = _python_stub(case_root)
+        completed = _run_webshop_launcher(
+            launcher,
+            repo_root=repo_root,
+            shared_root=case_root / "missing-shared",
+            python_bin=python_bin,
+            python_log=python_log,
+            dry_run=True,
+        )
+
+        assert completed.returncode == 0, completed.stderr
+        assert completed.stdout.startswith("module=verl.trainer.main_opsd\n")
+        assert not (
+            repo_root
+            / "agent_system/environments/env_package/webshop/webshop"
+        ).exists()
+        assert not python_log.exists()
 
 
 def test_all_six_launchers_compose_real_hydra_configs():
