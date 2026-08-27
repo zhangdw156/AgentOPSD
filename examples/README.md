@@ -24,27 +24,14 @@ token-level credit (`granularity=token`). Both use `v0_prior=0.5`,
 
 Fairness manifests are downloaded on first use to the default
 `$HOME/.cache/verl-agent/fairness` cache. ALFWorld raw data defaults to
-`$HOME/.cache/alfworld`. WebShop expects its raw data and search indexes
-repo-locally under
+`$HOME/.cache/alfworld`. WebShop raw data and search indexes remain repo-local under
 `agent_system/environments/env_package/webshop/webshop/{data,search_engine/indexes}`.
-On normal (non-dry-run) startup, each WebShop launcher leaves existing local
-resources untouched and creates missing symlinks for
-`data/items_shuffle_1000.json`, `data/items_ins_v2_1000.json`,
-`data/items_human_ins.json`, and `search_engine/indexes`. The shared source
-defaults to
-`/data/zhangdw12/work/verl-agent/agent_system/environments/env_package/webshop/webshop`
-and can be overridden with `WEBSHOP_SHARED_ROOT`. All required sources are
-checked before any link is created; concurrent starts are serialized, failed
-attempts roll back their links, and the data files plus Lucene index are
-validated. If one is invalid or missing, the launcher exits with the
-`./setup.sh -d all` command needed to prepare the shared root.
 
 ALFWorld launchers default to
 `/data/zhangdw12/work/verl-agent/.uv-venv/verl-agent/bin/python3` and
 conditionally preload the GLIBC shim from the same runtime root. WebShop
 launchers use `python3` and do not activate conda or mamba; activate the desired
-WebShop environment before running them. `LAUNCHER_DRY_RUN=true` neither checks
-nor creates these resource links.
+environment before running them.
 
 Fairness validation is exhaustive and chunked at no more than 128 concurrent
 environments: ALFWorld evaluates 140 seen plus 134 unseen tasks, while WebShop

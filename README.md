@@ -89,18 +89,6 @@ pip3 install vllm==0.8.2
 ```
 The `typer` version warnings can be safely ignored.
 
-On H20, activate the existing WebShop mamba environment before launching.
-The three `run_webshop.sh` scripts keep `PYTHON_BIN=python3` and do not activate
-an environment themselves. In a clean clone they reuse the prepared resources
-under
-`/data/zhangdw12/work/verl-agent/agent_system/environments/env_package/webshop/webshop`
-by creating missing repo-local symlinks for the three 1K data files and
-`search_engine/indexes`. Set `WEBSHOP_SHARED_ROOT` to override that shared
-resource root. Existing local resources are never replaced. Concurrent starts
-are serialized, failed attempts roll back their new links, and data/index
-assets are validated before training; if a shared source is invalid or missing,
-run its `./setup.sh -d all` first.
-
 ## 🚀 Training
 
 The paper-facing scripts live under `examples/` and assume the repo root as
