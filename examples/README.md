@@ -37,6 +37,22 @@ Fairness validation is exhaustive and chunked at no more than 128 concurrent
 environments: ALFWorld evaluates 140 seen plus 134 unseen tasks, while WebShop
 evaluates all 500 canonical evaluation tasks.
 
+## Rollout performance
+
+ALFWorld and WebShop now compact each generation/step batch to unfinished
+trajectories while scattering observations, histories, task metadata, and
+original row indices back to their stable environment slots. ALFWorld also
+keeps supported FSDP-vLLM rollout sessions resident for the bounded episode
+loop, so model weights and KV-cache allocation are not repeatedly
+woken/synchronized between turns. Unsupported rollout backends retain the
+legacy per-call context path.
+
+These optimizations do not change AgentOPSD semantics: ALFWorld still uses
+turn-level recursive credit and WebShop still uses token-level credit;
+SkillBank retrieval, teacher log-prob inputs, persistent WebShop RNG,
+fairness task identity, trajectory-GRPO grouping, and per-trajectory
+`turn_step` ordering remain attached to the original trajectory rows.
+
 Examples:
 
 ```bash

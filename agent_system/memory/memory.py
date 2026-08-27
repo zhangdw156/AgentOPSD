@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-from typing import List, Dict, Any, Tuple
+from typing import Any, Dict, List, Tuple
+
 from .base import BaseMemory
+
 
 class SimpleMemory(BaseMemory):
     """
@@ -54,6 +56,16 @@ class SimpleMemory(BaseMemory):
 
         for env_idx in range(self.batch_size):
             self._data[env_idx].append({k: record[k][env_idx] for k in self.keys})
+
+    def store_selected(self, indices: List[int], record: Dict[str, List[Any]]):
+        """Store one history row for each selected environment index."""
+        if self.keys is None:
+            self.keys = list(record.keys())
+        assert self.keys == list(record.keys())
+        assert all(len(record[key]) == len(indices) for key in self.keys)
+
+        for record_idx, env_idx in enumerate(indices):
+            self._data[env_idx].append({k: record[k][record_idx] for k in self.keys})
 
     def fetch(
         self,

@@ -13,22 +13,128 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-import numpy as np
-from verl import DataProto
-from verl.utils.dataset.rl_dataset import collate_fn
-from verl.utils.model import compute_position_id_with_mask
-import verl.utils.torch_functional as verl_F
-from transformers import PreTrainedTokenizer
+import logging
 import uuid
-from agent_system.multi_turn_rollout.utils import process_image, to_list_of_dict, torch_to_numpy, filter_group_data
+from contextlib import contextmanager, suppress
+from typing import Dict, List
+
+import numpy as np
+import torch
+from transformers import PreTrainedTokenizer
+
+import verl.utils.torch_functional as verl_F
+from agent_system.environments import EnvironmentManagerBase
+from agent_system.multi_turn_rollout.utils import (
+    filter_group_data,
+    process_image,
+    to_list_of_dict,
+    torch_to_numpy,
+)
+from verl import DataProto
+from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
 from verl.trainer.ppo.trajectory_grpo import (
     require_filter_target_reached,
     take_complete_uid_groups,
 )
-from agent_system.environments import EnvironmentManagerBase
-from typing import List, Dict
-from verl.protocol import pad_dataproto_to_divisor, unpad_dataproto
+from verl.utils.dataset.rl_dataset import collate_fn
+from verl.utils.model import compute_position_id_with_mask
+
+logger = logging.getLogger(__name__)
+
+
+def _record_session_cleanup_error(primary_error, cleanup_error):
+    with suppress(BaseException):
+        primary_error.rollout_session_cleanup_error = cleanup_error
+
+    with suppress(BaseException):
+        add_note = getattr(primary_error, "add_note", None)
+        if callable(add_note):
+            add_note(
+                f"rollout session cleanup also failed: "
+                f"{cleanup_error!r}"
+            )
+
+    with suppress(BaseException):
+        logger.error(
+            "Rollout session cleanup failed while preserving the primary "
+            "rollout error",
+            exc_info=(
+                type(cleanup_error),
+                cleanup_error,
+                cleanup_error.__traceback__,
+            ),
+        )
+
+
+@contextmanager
+def _rollout_session(actor_rollout_wg):
+    begin = getattr(actor_rollout_wg, "begin_rollout_session", None)
+    end = getattr(actor_rollout_wg, "end_rollout_session", None)
+    if not callable(begin) or not callable(end):
+        yield
+        return
+
+    primary_error = None
+    try:
+        begin()
+        yield
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        try:
+            end()
+        except BaseException as cleanup_error:
+            if primary_error is None:
+                raise
+            _record_session_cleanup_error(primary_error, cleanup_error)
+
+
+def _select_observation_rows(
+    obs: Dict,
+    indices: np.ndarray,
+) -> Dict:
+    selected = {}
+    for key, value in obs.items():
+        if value is None:
+            selected[key] = None
+        elif isinstance(value, torch.Tensor):
+            selected[key] = value[
+                torch.as_tensor(indices, device=value.device)
+            ]
+        elif isinstance(value, np.ndarray):
+            selected[key] = value[indices]
+        else:
+            selected[key] = [value[index] for index in indices]
+    return selected
+
+
+def _scatter_observation_rows(
+    obs: Dict,
+    selected_obs: Dict,
+    indices: np.ndarray,
+) -> Dict:
+    scattered = {}
+    for key, value in obs.items():
+        selected_value = selected_obs.get(key)
+        if value is None or selected_value is None:
+            scattered[key] = value
+        elif isinstance(value, torch.Tensor):
+            updated = value.clone()
+            updated[
+                torch.as_tensor(indices, device=value.device)
+            ] = selected_value
+            scattered[key] = updated
+        elif isinstance(value, np.ndarray):
+            updated = value.copy()
+            updated[indices] = selected_value
+            scattered[key] = updated
+        else:
+            updated = list(value)
+            for selected_index, original_index in enumerate(indices):
+                updated[original_index] = selected_value[selected_index]
+            scattered[key] = updated
+    return scattered
 
 
 def _gamefiles_from_infos(infos: List[Dict]) -> np.ndarray:
@@ -95,7 +201,7 @@ class TrajectoryCollector:
         if obs_text is not None:
             obs_content += obs_text
         else:
-            print(f"Warning: No text observation found!")
+            print("Warning: No text observation found!")
 
         
         chat = np.array([{
@@ -246,6 +352,55 @@ class TrajectoryCollector:
 
         return new_batch
 
+    def _prepare_and_generate_batch(
+        self,
+        gen_batch: DataProto,
+        obs: Dict,
+        actor_rollout_wg,
+        original_indices=None,
+    ) -> DataProto:
+        batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs)
+        if original_indices is not None:
+            if "index" in batch.batch:
+                index_values = batch.batch["index"]
+                batch.batch["index"] = torch.as_tensor(
+                    original_indices,
+                    dtype=index_values.dtype,
+                    device=index_values.device,
+                )
+            elif "index" in batch.non_tensor_batch:
+                batch.non_tensor_batch["index"] = np.asarray(
+                    original_indices,
+                    dtype=batch.non_tensor_batch["index"].dtype,
+                )
+
+        non_tensor_batch_keys = ["raw_prompt_ids"]
+        for key in (
+            "multi_modal_data",
+            "raw_prompt",
+            "tools_kwargs",
+        ):
+            if key in batch.non_tensor_batch:
+                non_tensor_batch_keys.append(key)
+
+        batch_input = batch.pop(
+            batch_keys=[
+                "input_ids",
+                "attention_mask",
+                "position_ids",
+            ],
+            non_tensor_batch_keys=non_tensor_batch_keys,
+        )
+        batch_input.meta_info = gen_batch.meta_info
+        batch_input, pad_size = pad_dataproto_to_divisor(
+            batch_input,
+            actor_rollout_wg.world_size,
+        )
+        batch_output = actor_rollout_wg.generate_sequences(batch_input)
+        return batch.union(
+            unpad_dataproto(batch_output, pad_size=pad_size)
+        )
+
 
     def gather_rollout_data(
             self,
@@ -348,84 +503,202 @@ class TrajectoryCollector:
         episode_lengths = np.zeros(batch_size, dtype=np.float32)
         episode_rewards = np.zeros(batch_size, dtype=np.float32)
         tool_callings = np.zeros(batch_size, dtype=np.float32)
-        # Trajectory collection loop
-        for _step in range(self.config.env.max_steps):
-            active_masks = np.logical_not(is_done)
+        with _rollout_session(actor_rollout_wg):
+            for _step in range(self.config.env.max_steps):
+                active_masks = np.logical_not(is_done)
 
-            obs_input = obs
-            if current_gamefiles is not None:
-                obs_input = {**obs, 'gamefile': current_gamefiles}
-            batch = self.preprocess_batch(gen_batch=gen_batch, obs=obs_input)
+                if hasattr(envs, "step_selected"):
+                    active_indices = np.flatnonzero(active_masks)
+                    active_gen_batch = gen_batch[active_indices]
+                    obs_input = {
+                        **obs,
+                        'gamefile': current_gamefiles,
+                    }
+                    active_obs = _select_observation_rows(
+                        obs_input,
+                        active_indices,
+                    )
+                    batch = self._prepare_and_generate_batch(
+                        active_gen_batch,
+                        active_obs,
+                        actor_rollout_wg,
+                        original_indices=active_indices,
+                    )
 
-            batch_keys_to_pop = ["input_ids", "attention_mask", "position_ids"]
-            non_tensor_batch_keys_to_pop = ["raw_prompt_ids"]
-            if "multi_modal_data" in batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("multi_modal_data")
-            if "raw_prompt" in batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("raw_prompt")
-            if "tools_kwargs" in batch.non_tensor_batch:
-                non_tensor_batch_keys_to_pop.append("tools_kwargs")
-            batch_input = batch.pop(
-                batch_keys=batch_keys_to_pop,
-                non_tensor_batch_keys=non_tensor_batch_keys_to_pop,
-            )
+                    batch.non_tensor_batch['uid'] = (
+                        uid_batch[active_indices]
+                    )
+                    batch.non_tensor_batch['traj_uid'] = (
+                        traj_uid[active_indices]
+                    )
 
-            batch_input.meta_info = gen_batch.meta_info
+                    text_actions = self.tokenizer.batch_decode(
+                        batch.batch['responses'],
+                        skip_special_tokens=True,
+                    )
+                    next_active_obs, rewards, dones, infos = (
+                        envs.step_selected(
+                            text_actions,
+                            active_indices.tolist(),
+                        )
+                    )
+                    current_gamefiles[active_indices] = (
+                        _gamefiles_from_infos(infos)
+                    )
 
-            # pad to be divisible by dp_size
-            batch_input_padded, pad_size = pad_dataproto_to_divisor(batch_input, actor_rollout_wg.world_size)
-            batch_output_padded = actor_rollout_wg.generate_sequences(batch_input_padded)
-            # # unpad
-            batch_output = unpad_dataproto(batch_output_padded, pad_size=pad_size)
+                    if len(rewards.shape) == 2:
+                        rewards = rewards.squeeze(1)
+                    if len(dones.shape) == 2:
+                        dones = dones.squeeze(1)
 
-            batch.non_tensor_batch['uid'] = uid_batch
-            batch.non_tensor_batch['traj_uid'] = traj_uid
+                    if 'is_action_valid' in infos[0]:
+                        batch.non_tensor_batch['is_action_valid'] = (
+                            np.array(
+                                [
+                                    info['is_action_valid']
+                                    for info in infos
+                                ],
+                                dtype=bool,
+                            )
+                        )
+                    else:
+                        batch.non_tensor_batch['is_action_valid'] = (
+                            np.ones(
+                                len(active_indices),
+                                dtype=bool,
+                            )
+                        )
 
-            batch = batch.union(batch_output)
-            
-            text_actions = self.tokenizer.batch_decode(batch.batch['responses'], skip_special_tokens=True)
-            
-            next_obs, rewards, dones, infos = envs.step(text_actions)
-            current_gamefiles = _gamefiles_from_infos(infos)
+                    if 'tool_calling' in infos[0]:
+                        tool_callings[active_indices] += np.array(
+                            [
+                                info['tool_calling']
+                                for info in infos
+                            ],
+                            dtype=np.float32,
+                        )
+                    episode_rewards[active_indices] += (
+                        torch_to_numpy(rewards)
+                    )
+                    episode_lengths[active_indices] += 1
 
-            if len(rewards.shape) == 2:
-                rewards = rewards.squeeze(1)
-            if len(dones.shape) == 2:
-                # dones is numpy, delete a dimension
-                dones = dones.squeeze(1)
+                    assert len(rewards) == len(active_indices), (
+                        "env should return rewards for selected "
+                        f"environments, got {len(rewards)} rewards for "
+                        f"{len(active_indices)} environments"
+                    )
+                    batch.non_tensor_batch['rewards'] = (
+                        torch_to_numpy(rewards, is_object=True)
+                    )
+                    batch.non_tensor_batch['active_masks'] = np.full(
+                        len(active_indices),
+                        True,
+                        dtype=object,
+                    )
 
-            if 'is_action_valid' in infos[0]:
-                batch.non_tensor_batch['is_action_valid'] = np.array([info['is_action_valid'] for info in infos], dtype=bool)
-            else:
-                batch.non_tensor_batch['is_action_valid'] = np.ones(batch_size, dtype=bool)
+                    batch_list: list[dict] = to_list_of_dict(batch)
+                    for selected_index, original_index in enumerate(
+                        active_indices
+                    ):
+                        total_batch_list[original_index].append(
+                            batch_list[selected_index]
+                        )
+                        total_infos[original_index].append(
+                            infos[selected_index]
+                        )
 
-            if 'tool_calling' in infos[0]:
-                tool_callings[active_masks] += np.array([info['tool_calling'] for info in infos], dtype=np.float32)[active_masks]
-            # Create reward tensor, only assign rewards for active environments
-            # episode_rewards += torch_to_numpy(rewards) * torch_to_numpy(active_masks)
-            episode_rewards[active_masks] += torch_to_numpy(rewards)[active_masks]
-            episode_lengths[active_masks] += 1
+                    is_done[active_indices] = np.logical_or(
+                        is_done[active_indices],
+                        dones,
+                    )
+                    obs = _scatter_observation_rows(
+                        obs,
+                        next_active_obs,
+                        active_indices,
+                    )
 
-            assert len(rewards) == batch_size, f"env should return rewards for all environments, got {len(rewards)} rewards for {batch_size} environments"
-            batch.non_tensor_batch['rewards'] = torch_to_numpy(rewards, is_object=True)
-            batch.non_tensor_batch['active_masks'] = torch_to_numpy(active_masks, is_object=True)
-            
-            # Update episode lengths for active environments
-            batch_list: list[dict] = to_list_of_dict(batch)
+                    if is_done.all():
+                        break
+                    continue
 
-            for i in range(batch_size):
-                total_batch_list[i].append(batch_list[i])
-                total_infos[i].append(infos[i])
+                obs_input = {
+                    **obs,
+                    'gamefile': current_gamefiles,
+                }
+                batch = self._prepare_and_generate_batch(
+                    gen_batch,
+                    obs_input,
+                    actor_rollout_wg,
+                )
 
-            # Update done states
-            is_done = np.logical_or(is_done, dones)
-                
-            # Update observations for next step
-            obs = next_obs
+                batch.non_tensor_batch['uid'] = uid_batch
+                batch.non_tensor_batch['traj_uid'] = traj_uid
 
-            # Break if all environments are done
-            if is_done.all():
-                break
+                text_actions = self.tokenizer.batch_decode(
+                    batch.batch['responses'],
+                    skip_special_tokens=True,
+                )
+                next_obs, rewards, dones, infos = envs.step(
+                    text_actions
+                )
+                current_gamefiles = _gamefiles_from_infos(infos)
+
+                if len(rewards.shape) == 2:
+                    rewards = rewards.squeeze(1)
+                if len(dones.shape) == 2:
+                    dones = dones.squeeze(1)
+
+                if 'is_action_valid' in infos[0]:
+                    batch.non_tensor_batch['is_action_valid'] = (
+                        np.array(
+                            [
+                                info['is_action_valid']
+                                for info in infos
+                            ],
+                            dtype=bool,
+                        )
+                    )
+                else:
+                    batch.non_tensor_batch['is_action_valid'] = (
+                        np.ones(batch_size, dtype=bool)
+                    )
+
+                if 'tool_calling' in infos[0]:
+                    tool_callings[active_masks] += np.array(
+                        [
+                            info['tool_calling']
+                            for info in infos
+                        ],
+                        dtype=np.float32,
+                    )[active_masks]
+                episode_rewards[active_masks] += (
+                    torch_to_numpy(rewards)[active_masks]
+                )
+                episode_lengths[active_masks] += 1
+
+                assert len(rewards) == batch_size, (
+                    "env should return rewards for all environments, "
+                    f"got {len(rewards)} rewards for "
+                    f"{batch_size} environments"
+                )
+                batch.non_tensor_batch['rewards'] = torch_to_numpy(
+                    rewards,
+                    is_object=True,
+                )
+                batch.non_tensor_batch['active_masks'] = torch_to_numpy(
+                    active_masks,
+                    is_object=True,
+                )
+
+                batch_list: list[dict] = to_list_of_dict(batch)
+                for i in range(batch_size):
+                    total_batch_list[i].append(batch_list[i])
+                    total_infos[i].append(infos[i])
+
+                is_done = np.logical_or(is_done, dones)
+                obs = next_obs
+                if is_done.all():
+                    break
         
         success: Dict[str, np.ndarray] = envs.success_evaluator(
                     total_infos=total_infos,
