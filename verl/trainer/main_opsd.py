@@ -3,9 +3,50 @@ Main entry point for OPSD (Bayesian Value Recursion for Token-Level Credit
 Assignment) training. Based on main_rlsd.py with OPSD-specific extensions.
 """
 
+import logging
+
 import hydra
 import ray
 from omegaconf import OmegaConf
+
+
+def _fit_trainer_with_cleanup(trainer) -> None:
+    """Initialize and run the trainer while always releasing environments."""
+
+    primary_error = None
+    try:
+        trainer.init_workers()
+        trainer.fit()
+    except BaseException as error:
+        primary_error = error
+        raise
+    finally:
+        cleanup_error = None
+        for attribute, label in (
+            ("envs", "training environments"),
+            ("val_envs", "validation environments"),
+        ):
+            environment = getattr(trainer, attribute, None)
+            close_environment = getattr(environment, "close", None)
+            if not callable(close_environment):
+                continue
+            try:
+                close_environment()
+            except BaseException as error:
+                if primary_error is not None:
+                    logging.exception(
+                        "Failed to close %s after trainer failure",
+                        label,
+                    )
+                elif cleanup_error is None:
+                    cleanup_error = error
+                else:
+                    logging.exception(
+                        "Failed to close %s after another cleanup failure",
+                        label,
+                    )
+        if primary_error is None and cleanup_error is not None:
+            raise cleanup_error
 
 
 @hydra.main(config_path="config", config_name="ppo_trainer", version_base=None)
@@ -179,8 +220,7 @@ class OPSDTaskRunner:
             val_envs=val_envs,
             skill_provider=skill_provider,
         )
-        trainer.init_workers()
-        trainer.fit()
+        _fit_trainer_with_cleanup(trainer)
 
 
 if __name__ == "__main__":

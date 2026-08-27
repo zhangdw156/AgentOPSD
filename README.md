@@ -59,11 +59,8 @@ pip3 install flash-attn==2.7.4.post1 --no-build-isolation --no-cache-dir
 pip install -e .
 ```
 
-Log in to Weights & Biases if you use WandB logging (scripts pass `trainer.logger=['console','wandb']`):
-
-```bash
-export WANDB_API_KEY=your_key_here
-```
+The ICLR experiment launchers log to SwanLab through
+`trainer.logger=['console','swanlab']`.
 
 ### Install Supported Environments
 
@@ -92,56 +89,22 @@ pip3 install vllm==0.8.2
 ```
 The `typer` version warnings can be safely ignored.
 
-#### 3. Search
-```bash
-cd ./agent_system/environments/env_package/search/third_party
-pip install -e .
-pip install gym==0.26.2
-
-cd repo_root/
-python examples/data_preprocess/preprocess_search_r1_dataset.py   # -> ~/data/searchR1_processed_direct
-```
-
-Set up a separate retriever environment (faiss-gpu is not available via pip). The retrieval server
-uses ~6GB GPU memory per GPU:
-```bash
-conda create -n retriever python=3.10 -y
-conda activate retriever
-conda install numpy==1.26.4
-pip install torch==2.6.0 torchvision==0.21.0 torchaudio==2.6.0 --index-url https://download.pytorch.org/whl/cu124
-pip install transformers datasets pyserini huggingface_hub
-conda install faiss-gpu==1.8.0 -c pytorch -c nvidia -y
-pip install uvicorn fastapi
-```
-
-Download the index and start the retrieval server:
-```bash
-conda activate retriever
-local_dir=~/data/searchR1
-python examples/search/searchr1_download.py --local_dir $local_dir
-cat $local_dir/part_* > $local_dir/e5_Flat.index
-gzip -d $local_dir/wiki-18.jsonl.gz
-
-bash examples/search/retriever/retrieval_launch.sh > retrieval_server.log
-```
-
 ## 🚀 Training
 
-All scripts live under `examples/` and assume the repo root as the working directory.
-AgentOPSD scripts are in `examples/agentopsd_trainer/`:
+The paper-facing scripts live under `examples/` and assume the repo root as
+the working directory:
 
 ```bash
-bash examples/agentopsd_trainer/run_alfworld_3b.sh
-bash examples/agentopsd_trainer/run_alfworld_7b.sh
-bash examples/agentopsd_trainer/run_search_3b.sh
-bash examples/agentopsd_trainer/run_webshop_3b.sh
+bash examples/agentopsd_trainer_1.5b/run_alfworld.sh
+bash examples/agentopsd_trainer_3b/run_webshop.sh
+bash examples/agentopsd_trainer_7b/run_alfworld.sh
 ```
 
-Hyperparameters are exposed at the top of every script. In the code the method is named `opsd`
-(`verl.trainer.main_opsd`, `algorithm.opsd.*`).
-
-Baselines used in the paper (GRPO, Skill-GRPO, OPSD, GRPO+OPSD, Skill-SD, RLSD, and the SDAR
-method) are also provided under `examples/` for reproduction.
+The six standalone ALFWorld/WebShop launchers use the canonical fairness
+protocol and preserve the official recursive turn-level AgentOPSD method. See
+`examples/README.md` for the exact launcher and runtime contract. In the code
+the method is named `opsd` (`verl.trainer.main_opsd`,
+`algorithm.opsd.*`).
 
 ### Merge checkpoints
 See `scripts/model_merger.py` for FSDP/Megatron merge examples using paths under `./checkpoints/...`.

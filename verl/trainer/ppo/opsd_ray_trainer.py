@@ -24,11 +24,15 @@ from verl import DataProto
 from verl.trainer.ppo.core_algos import agg_loss
 from verl.trainer.ppo.ray_trainer import (
     RayPPOTrainer,
+    _trajectory_config,
     _timer,
     apply_invalid_action_penalty,
     apply_kl_penalty,
     compute_advantage,
     compute_response_mask,
+)
+from verl.trainer.ppo.trajectory_grpo import (
+    NATIVE_TRAJECTORY_GRPO_CONFIG,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.opsd_utils import (
@@ -318,6 +322,16 @@ class OPSDRayTrainer(RayPPOTrainer):
                     del batch
                     batch = gen_batch_output
 
+                    trajectory_config = _trajectory_config(self.config)
+                    if (
+                        trajectory_config
+                        != NATIVE_TRAJECTORY_GRPO_CONFIG
+                    ):
+                        raise ValueError(
+                            "AgentOPSD preserves its official credit and "
+                            "requires native row/token_mean/step_row/"
+                            "step_local/off trajectory_grpo semantics"
+                        )
                     batch = adjust_batch(self.config, batch)
                     batch.batch["response_mask"] = compute_response_mask(batch)
 
@@ -578,4 +592,134 @@ class OPSDRayTrainer(RayPPOTrainer):
                     if self.config.trainer.critic_warmup <= self.global_steps:
                         with _timer("update_actor", timing_raw):
                             batch.meta_info["multi_turn"] = self.config.actor_rollout_ref.rollout.multi_turn.enable
-                            actor_outpu
+                            actor_output = self.actor_rollout_wg.update_actor(
+                                batch
+                            )
+                        actor_output_metrics = reduce_metrics(
+                            actor_output.meta_info["metrics"]
+                        )
+                        metrics.update(actor_output_metrics)
+
+                    rollout_data_dir = self.config.trainer.get(
+                        "rollout_data_dir",
+                        None,
+                    )
+                    if rollout_data_dir:
+                        with _timer(
+                            "dump_rollout_generations",
+                            timing_raw,
+                        ):
+                            inputs = self.tokenizer.batch_decode(
+                                batch.batch["prompts"],
+                                skip_special_tokens=True,
+                            )
+                            outputs = self.tokenizer.batch_decode(
+                                batch.batch["responses"],
+                                skip_special_tokens=True,
+                            )
+                            scores = (
+                                batch.batch["token_level_scores"]
+                                .sum(-1)
+                                .cpu()
+                                .tolist()
+                            )
+                            self._dump_generations(
+                                inputs=inputs,
+                                outputs=outputs,
+                                scores=scores,
+                                reward_extra_infos_dict=(
+                                    reward_extra_infos_dict
+                                ),
+                                dump_path=rollout_data_dir,
+                            )
+
+                    test_start_step = self.config.trainer.get(
+                        "test_start_step",
+                        0,
+                    )
+                    if (
+                        self.val_reward_fn is not None
+                        and self.config.trainer.test_freq > 0
+                        and (
+                            is_last_step
+                            or (
+                                self.global_steps >= test_start_step
+                                and self.global_steps
+                                % self.config.trainer.test_freq
+                                == 0
+                            )
+                        )
+                    ):
+                        with _timer("testing", timing_raw):
+                            val_metrics = self._validate()
+                            if is_last_step:
+                                last_val_metrics = val_metrics
+                        metrics.update(val_metrics)
+
+                    if (
+                        self.config.trainer.save_freq > 0
+                        and (
+                            is_last_step
+                            or self.global_steps
+                            % self.config.trainer.save_freq
+                            == 0
+                        )
+                    ):
+                        with _timer("save_checkpoint", timing_raw):
+                            self._save_checkpoint()
+
+                metrics.update(
+                    {
+                        "training/global_step": self.global_steps,
+                        "training/epoch": epoch,
+                    }
+                )
+                metrics.update(
+                    compute_data_metrics(
+                        batch=batch,
+                        use_critic=self.use_critic,
+                    )
+                )
+                metrics.update(
+                    compute_timing_metrics(
+                        batch=batch,
+                        timing_raw=timing_raw,
+                    )
+                )
+                n_gpus = self.resource_pool_manager.get_n_gpus()
+                metrics.update(
+                    compute_throughout_metrics(
+                        batch=batch,
+                        timing_raw=timing_raw,
+                        n_gpus=n_gpus,
+                    )
+                )
+                logger.log(data=metrics, step=self.global_steps)
+
+                progress_bar.update(1)
+                self.global_steps += 1
+                if is_last_step:
+                    pprint(
+                        f"Final validation metrics: {last_val_metrics}"
+                    )
+                    progress_bar.close()
+                    return
+
+    def _compute_teacher_log_probs(
+        self,
+        batch: DataProto,
+    ) -> torch.Tensor:
+        """Compute skill-conditioned teacher log probabilities."""
+
+        teacher_batch = build_teacher_batch(
+            batch=batch,
+            skill_provider=self.skill_provider,
+            tokenizer=self.tokenizer,
+            max_prompt_length=self.config.data.max_prompt_length,
+            truncation=self.config.data.get("truncation", "left"),
+            skill_position=self.opsd_skill_position,
+        )
+        teacher_output = self.actor_rollout_wg.compute_log_prob(
+            teacher_batch
+        )
+        return teacher_output.batch["old_log_probs"]

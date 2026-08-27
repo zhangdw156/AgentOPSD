@@ -1,4 +1,5 @@
 data:
+  seed: 0
   tokenizer: null
   use_shm: False
   train_files: ~/data/rlhf/gsm8k/train.parquet
@@ -236,6 +237,12 @@ algorithm:
   lam: 1.0
   adv_estimator: gae
   norm_adv_by_std_in_grpo: True
+  trajectory_grpo:
+    scheduler: row
+    reducer: token_mean
+    advantage: step_row
+    penalty: step_local
+    filter: "off"
   use_kl_in_reward: False
   kl_penalty: kl  # how to estimate kl divergence
   kl_ctrl:
@@ -291,6 +298,8 @@ ray_init:
 
 env:
   env_name: alfworld/AlfredTWEnv
+  fairness: true
+  validation_concurrency: 128
   seed: 0
   max_steps: 50
   history_length: 2

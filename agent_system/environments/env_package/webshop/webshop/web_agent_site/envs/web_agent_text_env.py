@@ -60,6 +60,7 @@ class WebAgentTextEnv(gym.Env):
         self.kwargs = kwargs
 
         self._seed = kwargs.get('seed', 42)
+        self._goal_seed = kwargs.get('goal_seed', self._seed)
 
         random.seed(self._seed)
         np.random.seed(self._seed)
@@ -69,6 +70,7 @@ class WebAgentTextEnv(gym.Env):
         self.attr_path = attr_path
 
         self.base_url = 'http://127.0.0.1:3000'
+        self._owns_server = server is None
         self.server = SimServer(
             self._seed,
             self.base_url,
@@ -79,7 +81,11 @@ class WebAgentTextEnv(gym.Env):
             self.kwargs.get('num_products'),
             self.kwargs.get('human_goals'),
             self.kwargs.get('show_attrs', False),
+            goal_seed=self._goal_seed,
         ) if server is None else server
+        random.seed(self._seed)
+        np.random.seed(self._seed)
+        torch.manual_seed(self._seed)
         self.browser = SimBrowser(self.server)
 
         self.session = self.kwargs.get('session')
@@ -276,7 +282,12 @@ class WebAgentTextEnv(gym.Env):
         pass
 
     def close(self):
-        pass
+        server = getattr(self, 'server', None)
+        if (
+            server is not None
+            and getattr(self, '_owns_server', True)
+        ):
+            server.close()
     
 
 def tag_visible(element):
@@ -299,6 +310,7 @@ class SimServer:
         num_products=None,
         human_goals=0,
         show_attrs=False,
+        goal_seed=None,
     ):
         """
         Constructor for simulated server serving WebShop application
@@ -309,17 +321,31 @@ class SimServer:
         num_products (`int`) -- Number of products to search across
         human_goals (`bool`) -- If true, load human goals; otherwise, load synthetic goals
         """
+        canonical_goal_seed = seed if goal_seed is None else goal_seed
+        construction_rng = random.Random(canonical_goal_seed)
+        shuffle_rng = random.Random(canonical_goal_seed)
+
         # Load all products, goals, and search engine
         self.base_url = base_url
         self.all_products, self.product_item_dict, self.product_prices, _ = \
-            load_products(filepath=file_path, attrpath=attr_path, num_products=num_products, human_goals=human_goals)
+            load_products(
+                filepath=file_path,
+                attrpath=attr_path,
+                num_products=num_products,
+                human_goals=human_goals,
+                rng=construction_rng,
+            )
         self.search_engine = init_search_engine(num_products=num_products)
-        self.goals = get_goals(self.all_products, self.product_prices, human_goals)
+        self.goals = get_goals(
+            self.all_products,
+            self.product_prices,
+            human_goals,
+            rng=construction_rng,
+        )
         self.show_attrs = show_attrs
 
         # Fix outcome for random shuffling of goals
-        random.seed(seed)
-        random.shuffle(self.goals)
+        shuffle_rng.shuffle(self.goals)
 
         # Apply `filter_goals` parameter if exists to select speific goal(s)
         if filter_goals is not None:
@@ -348,6 +374,19 @@ class SimServer:
         self.render_time = 0
         self.sample_time = 0
         self.assigned_instruction_text = None  # TODO: very hacky, should remove
+
+    def close(self):
+        if getattr(self, '_closed', False):
+            return
+
+        search_engine = getattr(self, 'search_engine', None)
+        self.search_engine = None
+        try:
+            if search_engine is not None:
+                search_engine.close()
+        finally:
+            self.user_sessions.clear()
+            self._closed = True
         
     @app.route('/', methods=['GET', 'POST'])
     def index(self, session_id, **kwargs):

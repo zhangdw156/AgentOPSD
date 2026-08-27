@@ -13,13 +13,68 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-import torch
-import numpy as np
-import random
-from typing import List, Tuple, Dict
 import math
+from collections.abc import Hashable, Sequence
+from typing import Dict, List, cast
+
+import numpy as np
+import torch
 from PIL import Image
+
 from verl import DataProto
+from verl.trainer.ppo.trajectory_grpo import (
+    group_rows_by_uid_traj_uid,
+    make_zero_weight_padding,
+    select_penalty_aware_group_indices,
+)
+
+
+def _trajectory_grpo_value(config, name, default):
+    trajectory_config = config.algorithm.get("trajectory_grpo", {})
+    return trajectory_config.get(name, default)
+
+
+def _needs_trajectory_row_metadata(config) -> bool:
+    return any(
+        (
+            _trajectory_grpo_value(config, "scheduler", "row")
+            in {"trajectory", "trajectory_packed"},
+            _trajectory_grpo_value(
+                config,
+                "reducer",
+                "token_mean",
+            )
+            == "trajectory_mean",
+            _trajectory_grpo_value(
+                config,
+                "advantage",
+                "step_row",
+            )
+            == "trajectory",
+            _trajectory_grpo_value(
+                config,
+                "penalty",
+                "step_local",
+            )
+            == "trajectory",
+        )
+    )
+
+
+def _trajectory_invalid_counts(
+    batch_list: List[List[Dict]],
+) -> np.ndarray:
+    return np.asarray(
+        [
+            sum(
+                not bool(row.get("is_action_valid", True))
+                for row in trajectory
+                if bool(row.get("active_masks", True))
+            )
+            for trajectory in batch_list
+        ],
+        dtype=np.float64,
+    )
 
 def to_list_of_dict(batch: DataProto) -> list[dict]:
     tensors = batch.batch
@@ -99,6 +154,58 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
     # check if the batch size is divisible by the dp size, if not, delete the last few samples to make it divisible
     bs = len(data)
     remainder = bs % size_divisor
+    if _needs_trajectory_row_metadata(config):
+        if mode != "copy":
+            raise ValueError(
+                "trajectory-aware row processing only supports "
+                "deterministic zero-weight padding"
+            )
+        if (
+            "uid" not in data.non_tensor_batch
+            or "traj_uid" not in data.non_tensor_batch
+        ):
+            raise ValueError(
+                "trajectory-aware row processing requires uid and "
+                "traj_uid metadata"
+            )
+
+        device = data.batch["input_ids"].device
+        groups = group_rows_by_uid_traj_uid(
+            data.non_tensor_batch["uid"],
+            data.non_tensor_batch["traj_uid"],
+        )
+        trajectory_ids = np.empty(bs, dtype=np.int64)
+        for trajectory_id, group in enumerate(groups):
+            trajectory_ids[
+                np.asarray(group.row_indices, dtype=np.int64)
+            ] = trajectory_id
+        data.batch["row_weights"] = torch.ones(
+            bs,
+            dtype=torch.float32,
+            device=device,
+        )
+        data.batch["trajectory_id"] = torch.as_tensor(
+            trajectory_ids,
+            dtype=torch.int64,
+            device=device,
+        )
+        if remainder == 0:
+            return data
+
+        padding = make_zero_weight_padding(
+            np.arange(bs, dtype=np.int64),
+            bs + size_divisor - remainder,
+        )
+        adjusted_batch = data.select_idxs(padding.indices)
+        adjusted_batch.batch["row_weights"] = torch.as_tensor(
+            padding.weights,
+            dtype=torch.float32,
+            device=device,
+        )
+        if "loss_mask" in adjusted_batch.batch:
+            adjusted_batch.batch["loss_mask"][bs:] = 0
+        return adjusted_batch
+
     if remainder == 0:
         return data
     
@@ -130,7 +237,7 @@ def adjust_batch(config, data: DataProto, mode="copy") -> DataProto:
     return adjusted_batch
 
 
-def filter_group_data(batch_list : List[Dict],
+def filter_group_data(batch_list : List[List[Dict]],
                         episode_rewards: np.ndarray,
                         episode_lengths: np.ndarray,
                         success: Dict[str, np.ndarray],
@@ -144,29 +251,52 @@ def filter_group_data(batch_list : List[Dict],
     Over-sample and filter out episode group in which all episodes have the same rewards.
     Adopted from DAPO (https://arxiv.org/abs/2503.14476)
     """
+    filter_mode = str(
+        _trajectory_grpo_value(config, "filter", "off")
+    ).replace("-", "_")
+    penalty_aware = filter_mode == "penalty_aware"
     if last_try:
         return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
-    
-    batch_size = config.data.train_batch_size
-    group_n = config.env.rollout.n
-    if group_n <= 1:
-        print("Warning: group_n <= 1, no need to adopt dynamic sampling")
 
-    # Handle each group
-    keep_indices = np.array([], dtype=np.int64)
-    for i in range(batch_size):
-        # Get the indices of the current group
-        group_indices = np.arange(i * group_n, (i + 1) * group_n)
-        group_rewards = episode_rewards[group_indices]
-
-        # check if all group_traj_uid are the same
-        for index in group_indices:
-            assert batch_list[index][0]['uid'] == batch_list[group_indices[0]][0]['uid']
-
-        # Check if all rewards in the group are the same
-        if not np.all(group_rewards == group_rewards[0]):
-            # If so, keep the entire group, otherwise, remove it
-            keep_indices = np.concatenate((keep_indices, group_indices))
+    if penalty_aware:
+        trajectory_uids = np.asarray(
+            [trajectory[0]["uid"] for trajectory in batch_list],
+            dtype=object,
+        )
+        keep_indices, _ = select_penalty_aware_group_indices(
+            cast(Sequence[Hashable], trajectory_uids),
+            cast(Sequence[float], episode_rewards),
+            cast(
+                Sequence[float],
+                _trajectory_invalid_counts(batch_list),
+            ),
+            invalid_action_penalty_coef=(
+                config.actor_rollout_ref.actor.invalid_action_penalty_coef
+            ),
+        )
+    else:
+        batch_size = config.data.train_batch_size
+        group_n = config.env.rollout.n
+        if group_n <= 1:
+            print(
+                "Warning: group_n <= 1, no need to adopt dynamic sampling"
+            )
+        keep_indices = np.array([], dtype=np.int64)
+        for i in range(batch_size):
+            group_indices = np.arange(
+                i * group_n,
+                (i + 1) * group_n,
+            )
+            group_rewards = episode_rewards[group_indices]
+            for index in group_indices:
+                assert (
+                    batch_list[index][0]["uid"]
+                    == batch_list[group_indices[0]][0]["uid"]
+                )
+            if not np.all(group_rewards == group_rewards[0]):
+                keep_indices = np.concatenate(
+                    (keep_indices, group_indices)
+                )
     
     # Filter the batch_list, episode_rewards, episode_lengths, success, and tool_callings based on the keep_indices
     success = {
@@ -182,4 +312,3 @@ def filter_group_data(batch_list : List[Dict],
     tool_callings = tool_callings[keep_indices]
 
     return batch_list, episode_rewards, episode_lengths, success, traj_uid, tool_callings
-

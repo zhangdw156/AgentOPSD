@@ -52,6 +52,10 @@ from verl.trainer.ppo.metric_utils import (
     process_validation_metrics,
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
+from verl.trainer.ppo.trajectory_grpo import (
+    NATIVE_TRAJECTORY_GRPO_CONFIG,
+    validate_trajectory_grpo_config,
+)
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
 from verl.utils.metric import (
     reduce_metrics,
@@ -239,6 +243,13 @@ def compute_response_mask(data: DataProto):
     response_length = responses.size(1)
     attention_mask = data.batch["attention_mask"]
     return attention_mask[:, -response_length:]
+
+
+def _trajectory_config(config) -> dict:
+    return OmegaConf.to_container(
+        config.algorithm.trajectory_grpo,
+        resolve=True,
+    )
 
 
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
@@ -462,6 +473,17 @@ class RayPPOTrainer:
 
     def _validate_config(self):
         config = self.config
+        validate_trajectory_grpo_config(
+            OmegaConf.to_container(config, resolve=True)
+        )
+        trajectory_config = _trajectory_config(config)
+        for name, expected in NATIVE_TRAJECTORY_GRPO_CONFIG.items():
+            actual = trajectory_config[name]
+            if actual != expected:
+                raise ValueError(
+                    "AgentOPSD fairness runners require native step_row "
+                    f"trajectory_grpo.{name}={expected!r}, got {actual!r}"
+                )
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
@@ -691,15 +713,56 @@ class RayPPOTrainer:
         data_source_lst = []
         tool_calling_list = []
         traj_uid_list = []
-        success_rate_dict = {}
+        success_rate_totals = {}
+        success_rate_counts = {}
+        completed_counts = {}
 
         # Lists to collect samples for the table
         sample_inputs = []
         sample_outputs = []
         sample_scores = []
 
-        for test_data in self.val_dataloader:
+        canonical_validation = callable(
+            getattr(self.val_envs, "iter_chunks", None)
+        )
+        if canonical_validation:
+            validation_repeat = int(
+                self.config.actor_rollout_ref.rollout.val_kwargs.n
+            )
+            if validation_repeat != 1:
+                raise ValueError(
+                    "Canonical exhaustive validation evaluates each task "
+                    f"once; val_kwargs.n must be 1, got {validation_repeat}"
+                )
+            validation_batches = list(self.val_dataloader)
+            if len(validation_batches) != 1:
+                raise ValueError(
+                    "Canonical exhaustive validation requires one placeholder "
+                    f"batch, found {len(validation_batches)}"
+                )
+            template_data = validation_batches[0]
+            template_size = len(template_data["input_ids"])
+            if template_size < 128:
+                raise ValueError(
+                    "Canonical exhaustive validation requires at least 128 "
+                    f"placeholder rows, found {template_size}"
+                )
+            validation_runs = (
+                (chunk, template_data)
+                for chunk in self.val_envs.iter_chunks()
+            )
+        else:
+            validation_runs = (
+                (None, test_data)
+                for test_data in self.val_dataloader
+            )
+
+        for validation_chunk, test_data in validation_runs:
             test_batch = DataProto.from_single_dict(test_data)
+            if validation_chunk is not None:
+                test_batch = test_batch[
+                    np.arange(validation_chunk.task_count)
+                ]
 
             # repeat test batch
             test_batch = test_batch.repeat(repeat_times=self.config.actor_rollout_ref.rollout.val_kwargs.n, interleave=True)
@@ -749,7 +812,11 @@ class RayPPOTrainer:
             test_output_gen_batch = self.traj_collector.multi_turn_loop(
                                                     gen_batch=test_gen_batch,
                                                     actor_rollout_wg=self.actor_rollout_wg,
-                                                    envs=self.val_envs,
+                                                    envs=(
+                                                        validation_chunk.manager
+                                                        if validation_chunk is not None
+                                                        else self.val_envs
+                                                    ),
                                                     is_train=False,
                                                     )
             print('validation generation end')
@@ -775,12 +842,38 @@ class RayPPOTrainer:
             # success rate
             for k in test_batch.non_tensor_batch.keys():
                 if 'success_rate' in k:
-                    if k not in success_rate_dict:
-                        success_rate_dict[k] = []
-                    success_rate_dict[k].append(test_batch.non_tensor_batch[k][0])
+                    metric_key = (
+                        f"{validation_chunk.metric_prefix}{k}"
+                        if validation_chunk is not None
+                        else k
+                    )
+                    metric_count = (
+                        validation_chunk.task_type_counts.get(
+                            k,
+                            validation_chunk.task_count,
+                        )
+                        if validation_chunk is not None
+                        else reward_tensor.shape[0]
+                    )
+                    if metric_count <= 0:
+                        continue
+                    success_rate_totals[metric_key] = (
+                        success_rate_totals.get(metric_key, 0.0)
+                        + float(test_batch.non_tensor_batch[k][0])
+                        * metric_count
+                    )
+                    success_rate_counts[metric_key] = (
+                        success_rate_counts.get(metric_key, 0)
+                        + metric_count
+                    )
                     # all success_rate should be the same
                     for i in range(1, len(test_batch.non_tensor_batch[k])):
                         assert test_batch.non_tensor_batch[k][0] == test_batch.non_tensor_batch[k][i], f'not all success_rate are the same, 0: {test_batch.non_tensor_batch[k][0]}, {i}: {test_batch.non_tensor_batch[k][i]}'
+            if validation_chunk is not None:
+                completed_counts[validation_chunk.metric_prefix] = (
+                    completed_counts.get(validation_chunk.metric_prefix, 0)
+                    + validation_chunk.task_count
+                )
 
         self._maybe_log_val_generations(inputs=sample_inputs, outputs=sample_outputs, scores=sample_scores)
 
@@ -788,7 +881,10 @@ class RayPPOTrainer:
         data_sources = np.concatenate(data_source_lst, axis=0)
         tool_callings = np.concatenate(tool_calling_list, axis=0)
         traj_uids = np.concatenate(traj_uid_list, axis=0)
-        success_rate = {k: np.mean(v) for k, v in success_rate_dict.items()}
+        success_rate = {
+            key: success_rate_totals[key] / success_rate_counts[key]
+            for key in success_rate_totals
+        }
 
         # evaluate test_score based on data source
         data_source_reward = {}
@@ -822,6 +918,8 @@ class RayPPOTrainer:
 
         for k, v in success_rate.items():
             metric_dict[f'val/{k}'] = v
+        for prefix, count in completed_counts.items():
+            metric_dict[f"val/{prefix}completed_count"] = count
 
         return metric_dict
 
@@ -1115,6 +1213,7 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     
+                    trajectory_config = _trajectory_config(self.config)
                     batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1218,6 +1317,14 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
+                        if (
+                            trajectory_config
+                            != NATIVE_TRAJECTORY_GRPO_CONFIG
+                        ):
+                            raise ValueError(
+                                "Only native row/token_mean/step_row/"
+                                "step_local/off trajectory_grpo is supported"
+                            )
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
