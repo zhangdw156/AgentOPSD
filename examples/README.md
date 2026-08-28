@@ -37,8 +37,11 @@ GRPO launchers.
 
 Fairness manifests are downloaded on first use to the default
 `$HOME/.cache/verl-agent/fairness` cache. ALFWorld raw data defaults to
-`$HOME/.cache/alfworld`. WebShop raw data and search indexes remain repo-local under
-`agent_system/environments/env_package/webshop/webshop/{data,search_engine/indexes}`.
+`$HOME/.cache/alfworld`. On normal startup, missing WebShop data files and
+`search_engine/indexes` are linked to the prepared sibling `../verl-agent`
+checkout. The links themselves are always relative, so moving all five sibling
+repositories together preserves them. Existing local resources are not
+replaced. `WEBSHOP_SHARED_ROOT` can override the shared checkout when needed.
 
 ALFWorld launchers default to
 `/data/zhangdw12/work/verl-agent/.uv-venv/verl-agent/bin/python3` and
