@@ -22,6 +22,19 @@ token-level credit (`granularity=token`). Both use `v0_prior=0.5`,
 `belief_mult=true`, `mult_lambda=0.5`, `signed=true`, task-specific
 `skills_dir`, and `skill_all=false`.
 
+AgentOPSD performs an additional actor log-probability forward pass over the
+skill-conditioned version of every generated turn. Its rollout log-probability
+micro-batches therefore use the same conservative half-size profile as SDAR:
+
+| Model | ALFWorld | WebShop |
+| --- | ---: | ---: |
+| 1.5B | 32 | 16 |
+| 3B | 16 | 8 |
+| 7B | 4 | 4 |
+
+Actor PPO and reference-policy micro-batches remain aligned with the matching
+GRPO launchers.
+
 Fairness manifests are downloaded on first use to the default
 `$HOME/.cache/verl-agent/fairness` cache. ALFWorld raw data defaults to
 `$HOME/.cache/alfworld`. WebShop raw data and search indexes remain repo-local under

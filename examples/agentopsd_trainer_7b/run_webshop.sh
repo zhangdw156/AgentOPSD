@@ -59,7 +59,7 @@ ACTOR_ARGS=(
 ROLLOUT_ARGS=(
     "actor_rollout_ref.rollout.name=vllm" "++actor_rollout_ref.rollout.seed=0"
     "actor_rollout_ref.rollout.tensor_model_parallel_size=4"
-    "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=8"
+    "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=4"
     "actor_rollout_ref.rollout.gpu_memory_utilization=0.45"
     "actor_rollout_ref.rollout.enable_chunked_prefill=False"
     "actor_rollout_ref.rollout.enforce_eager=False"
