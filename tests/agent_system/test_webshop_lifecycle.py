@@ -255,6 +255,129 @@ def test_fair_webshop_pool_is_lazy_and_val_only_skips_train(
         train_envs.close()
 
 
+def test_nonfair_webshop_pools_are_lazy_phase_exclusive_and_reuse_rng(
+    monkeypatch,
+):
+    events = []
+    live_pools = set()
+    peak_live_pools = 0
+    rngs = {"train": [], "validation": []}
+
+    class FakeRawPool:
+        def __init__(self, label):
+            nonlocal peak_live_pools
+            self.label = label
+            self.closed = False
+            live_pools.add(label)
+            peak_live_pools = max(peak_live_pools, len(live_pools))
+            events.append(f"build:{label}")
+
+        def close(self):
+            if self.closed:
+                return
+            self.closed = True
+            live_pools.remove(self.label)
+            events.append(f"close:{self.label}")
+
+    class FakeManager:
+        def __init__(self, raw_pool, _projection, _config):
+            self.raw_pool = raw_pool
+
+        def identity(self):
+            return self.raw_pool.label
+
+        def close(self):
+            self.raw_pool.close()
+
+    def build_webshop_envs(*, is_train, rng=None, **_kwargs):
+        label = "train" if is_train else "validation"
+        rngs[label].append(rng)
+        return FakeRawPool(label)
+
+    webshop_module = types.ModuleType(
+        "agent_system.environments.env_package.webshop"
+    )
+    webshop_module.build_webshop_envs = build_webshop_envs
+    webshop_module.webshop_projection = lambda actions: actions
+    monkeypatch.setattr(
+        environments_package,
+        "env_package",
+        env_package,
+        raising=False,
+    )
+    monkeypatch.setattr(
+        env_package,
+        "webshop",
+        webshop_module,
+        raising=False,
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        "agent_system.environments.env_package.webshop",
+        webshop_module,
+    )
+    monkeypatch.setattr(
+        env_manager,
+        "WebshopEnvironmentManager",
+        FakeManager,
+    )
+
+    config = OmegaConf.create(
+        {
+            "env": {
+                "env_name": "Webshop",
+                "seed": 0,
+                "fairness": False,
+                "rollout": {"n": 8},
+                "resources_per_worker": {
+                    "num_cpus": 0.1,
+                    "num_gpus": 0,
+                },
+                "webshop": {
+                    "use_small": True,
+                    "human_goals": False,
+                },
+            },
+            "data": {
+                "train_batch_size": 16,
+                "val_batch_size": 128,
+            },
+            "trainer": {"val_only": False},
+        }
+    )
+
+    train_envs, validation_envs = env_manager.make_envs(config)
+
+    assert events == []
+    assert train_envs.identity() == "train"
+    assert live_pools == {"train"}
+    assert validation_envs.identity() == "validation"
+    assert live_pools == {"validation"}
+    assert train_envs.identity() == "train"
+    assert live_pools == {"train"}
+    assert validation_envs.identity() == "validation"
+    assert live_pools == {"validation"}
+
+    train_envs.close()
+    validation_envs.close()
+
+    assert peak_live_pools == 1
+    assert len(rngs["train"]) == 2
+    assert rngs["train"][0] is rngs["train"][1]
+    assert len(rngs["validation"]) == 2
+    assert rngs["validation"][0] is rngs["validation"][1]
+    assert events == [
+        "build:train",
+        "close:train",
+        "build:validation",
+        "close:validation",
+        "build:train",
+        "close:train",
+        "build:validation",
+        "close:validation",
+    ]
+
+
 def test_webshop_environment_close_closes_searcher_once(monkeypatch):
     module = _load_webshop_text_env_with_stubs(monkeypatch)
     close_calls = []

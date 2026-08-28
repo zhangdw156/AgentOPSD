@@ -15,6 +15,7 @@
 
 import logging
 import os
+import threading
 from dataclasses import dataclass
 from functools import partial
 from typing import Any, Callable, Dict, Iterator, List, Optional, Tuple
@@ -42,40 +43,87 @@ class LazyEnvironmentManager:
     def __init__(
         self,
         factory: Callable[[], EnvironmentManagerBase],
+        *,
+        on_acquire: Optional[Callable[[], None]] = None,
+        lock: Optional[Any] = None,
     ) -> None:
         self._factory = factory
+        self._on_acquire = on_acquire
+        self._lock = lock or threading.RLock()
         self._manager: Optional[EnvironmentManagerBase] = None
         self._closed = False
 
     @property
     def is_active(self) -> bool:
-        return self._manager is not None
+        with self._lock:
+            return self._manager is not None
+
+    def set_on_acquire(
+        self,
+        on_acquire: Optional[Callable[[], None]],
+    ) -> None:
+        with self._lock:
+            if self._manager is not None:
+                raise RuntimeError(
+                    "Cannot change acquire callback while manager is active"
+                )
+            if self._closed:
+                raise RuntimeError("Lazy environment manager is closed")
+            self._on_acquire = on_acquire
 
     def _acquire(self) -> EnvironmentManagerBase:
-        if self._closed:
-            raise RuntimeError("Lazy environment manager is closed")
-        if self._manager is None:
-            self._manager = self._factory()
-        return self._manager
+        with self._lock:
+            if self._closed:
+                raise RuntimeError("Lazy environment manager is closed")
+            if self._manager is None:
+                if self._on_acquire is not None:
+                    self._on_acquire()
+                self._manager = self._factory()
+            return self._manager
 
     def release(self) -> None:
-        manager = self._manager
-        self._manager = None
-        if manager is not None:
-            manager.close()
+        with self._lock:
+            manager = self._manager
+            self._manager = None
+            if manager is not None:
+                manager.close()
 
     def close(self) -> None:
-        if self._closed:
-            return
-        try:
+        with self._lock:
+            if self._closed:
+                return
             self.release()
-        finally:
             self._closed = True
 
     def __getattr__(self, name: str) -> Any:
         if name.startswith("_"):
             raise AttributeError(name)
         return getattr(self._acquire(), name)
+
+
+def make_phase_exclusive_managers(
+    training_factory: Optional[Callable[[], EnvironmentManagerBase]],
+    validation_factory: Callable[[], EnvironmentManagerBase],
+) -> Tuple[
+    Optional[LazyEnvironmentManager],
+    LazyEnvironmentManager,
+]:
+    """Build lazy train/validation managers sharing one phase lock."""
+
+    phase_lock = threading.RLock()
+    training_manager = (
+        LazyEnvironmentManager(training_factory, lock=phase_lock)
+        if training_factory is not None
+        else None
+    )
+    validation_manager = LazyEnvironmentManager(
+        validation_factory,
+        lock=phase_lock,
+    )
+    if training_manager is not None:
+        training_manager.set_on_acquire(validation_manager.release)
+        validation_manager.set_on_acquire(training_manager.release)
+    return training_manager, validation_manager
 
 
 class CanonicalValidationEnvironments:
@@ -1132,33 +1180,50 @@ def make_envs(config):
             )
             return envs, val_envs
 
-        _envs = build_webshop_envs(
-            seed=config.env.seed,
-            env_num=config.data.train_batch_size,
-            group_n=group_n,
-            is_train=True,
-            env_kwargs=env_kwargs,
-            resources_per_worker=resources_per_worker,
-        )
-        envs = WebshopEnvironmentManager(_envs, projection_f, config)
-        _val_envs = build_webshop_envs(
-            seed=config.env.seed + 1000,
-            env_num=config.data.val_batch_size,
-            group_n=1,
-            is_train=False,
-            env_kwargs=env_kwargs,
-            resources_per_worker=resources_per_worker,
-        )
-        val_envs = WebshopEnvironmentManager(_val_envs, projection_f, config)
-        import time
-        time.sleep(
-            (
-                config.data.train_batch_size * group_n
-                + config.data.val_batch_size
+        training_factory = None
+        if not config.trainer.get("val_only", False):
+            training_rng = np.random.RandomState(config.env.seed)
+
+            def build_training_manager():
+                raw_envs = build_webshop_envs(
+                    seed=config.env.seed,
+                    env_num=config.data.train_batch_size,
+                    group_n=group_n,
+                    is_train=True,
+                    env_kwargs=env_kwargs,
+                    resources_per_worker=resources_per_worker,
+                    rng=training_rng,
+                )
+                return WebshopEnvironmentManager(
+                    raw_envs,
+                    projection_f,
+                    config,
+                )
+
+            training_factory = build_training_manager
+
+        validation_rng = np.random.RandomState(config.env.seed + 1000)
+
+        def build_validation_manager():
+            raw_envs = build_webshop_envs(
+                seed=config.env.seed + 1000,
+                env_num=config.data.val_batch_size,
+                group_n=1,
+                is_train=False,
+                env_kwargs=env_kwargs,
+                resources_per_worker=resources_per_worker,
+                rng=validation_rng,
             )
-            * 0.1
-        ) # wait for the envs to be ready
-        return envs, val_envs
+            return WebshopEnvironmentManager(
+                raw_envs,
+                projection_f,
+                config,
+            )
+
+        return make_phase_exclusive_managers(
+            training_factory,
+            build_validation_manager,
+        )
     elif "appworld" in config.env.env_name.lower():
         from agent_system.environments.env_package.appworld import appworld_projection, build_appworld_envs
         _envs = build_appworld_envs(dataset_name='train', seed=config.env.seed, env_num=config.data.train_batch_size, group_n=group_n, start_server_id=0, resources_per_worker=resources_per_worker)
