@@ -53,7 +53,6 @@ from verl.trainer.ppo.metric_utils import (
 )
 from verl.trainer.ppo.reward import compute_reward, compute_reward_async
 from verl.trainer.ppo.trajectory_grpo import (
-    NATIVE_TRAJECTORY_GRPO_CONFIG,
     validate_trajectory_grpo_config,
 )
 from verl.utils.checkpoint.checkpoint_manager import find_latest_ckpt_path
@@ -245,13 +244,6 @@ def compute_response_mask(data: DataProto):
     return attention_mask[:, -response_length:]
 
 
-def _trajectory_config(config) -> dict:
-    return OmegaConf.to_container(
-        config.algorithm.trajectory_grpo,
-        resolve=True,
-    )
-
-
 def compute_advantage(data: DataProto, adv_estimator, gamma=1.0, lam=1.0, num_repeat=1, multi_turn=False, norm_adv_by_std_in_grpo=True, step_advantage_w=1.0, gigpo_mode="mean_std_norm", gigpo_enable_similarity=False, gigpo_similarity_thresh=0.95, **kwargs):
     """Compute advantage estimates for policy optimization.
 
@@ -399,6 +391,9 @@ class RayPPOTrainer:
     Note that this trainer runs on the driver process on a single CPU/GPU node.
     """
 
+    progress_bar_description = "Training Progress"
+    log_rollout_prob_diagnostics = True
+
     # TODO: support each role have individual ray_worker_group_cls,
     # i.e., support different backend of different role
     def __init__(
@@ -476,14 +471,6 @@ class RayPPOTrainer:
         validate_trajectory_grpo_config(
             OmegaConf.to_container(config, resolve=True)
         )
-        trajectory_config = _trajectory_config(config)
-        for name, expected in NATIVE_TRAJECTORY_GRPO_CONFIG.items():
-            actual = trajectory_config[name]
-            if actual != expected:
-                raise ValueError(
-                    "AgentOPSD fairness runners require native step_row "
-                    f"trajectory_grpo.{name}={expected!r}, got {actual!r}"
-                )
         # number of GPUs total
         n_gpus = config.trainer.n_gpus_per_node * config.trainer.nnodes
 
@@ -1102,6 +1089,21 @@ class RayPPOTrainer:
         global_balance_stats = log_seqlen_unbalance(seqlen_list=global_seqlen_lst, partitions=global_partition_lst, prefix=logging_prefix)
         metrics.update(global_balance_stats)
 
+    def _prepare_advantage_inputs(
+        self,
+        batch: DataProto,
+        metrics: dict,
+        timing_raw: dict,
+    ) -> DataProto:
+        return batch
+
+    def _postprocess_advantages(
+        self,
+        batch: DataProto,
+        metrics: dict,
+    ) -> DataProto:
+        return batch
+
     def fit(self):
         """
         The training loop of PPO.
@@ -1136,7 +1138,7 @@ class RayPPOTrainer:
                 return
 
         # add tqdm
-        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="Training Progress")
+        progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc=self.progress_bar_description)
 
         # we start from step 1
         self.global_steps += 1
@@ -1213,7 +1215,6 @@ class RayPPOTrainer:
                         )
                         batch.batch['step_rewards'] = step_rewards_tensor
                     
-                    trajectory_config = _trajectory_config(self.config)
                     batch = adjust_batch(self.config, batch)
 
                     batch.batch["response_mask"] = compute_response_mask(batch)
@@ -1249,7 +1250,10 @@ class RayPPOTrainer:
                         old_log_prob.batch.pop("entropys")
                         batch = batch.union(old_log_prob)
 
-                        if "rollout_log_probs" in batch.batch.keys():
+                        if (
+                            self.log_rollout_prob_diagnostics
+                            and "rollout_log_probs" in batch.batch.keys()
+                        ):
                             # TODO: we may want to add diff of probs too.
                             rollout_old_log_probs = batch.batch["rollout_log_probs"]
                             actor_old_log_probs = batch.batch["old_log_probs"]
@@ -1272,6 +1276,12 @@ class RayPPOTrainer:
                                     "training/rollout_probs_diff_std": rollout_probs_diff_std.detach().item(),
                                 }
                             )
+
+                    batch = self._prepare_advantage_inputs(
+                        batch,
+                        metrics,
+                        timing_raw,
+                    )
 
                     if self.use_reference_policy:
                         # compute reference log_prob
@@ -1317,14 +1327,6 @@ class RayPPOTrainer:
 
                         norm_adv_by_std_in_grpo = self.config.algorithm.get("norm_adv_by_std_in_grpo", True)  # GRPO adv normalization factor
 
-                        if (
-                            trajectory_config
-                            != NATIVE_TRAJECTORY_GRPO_CONFIG
-                        ):
-                            raise ValueError(
-                                "Only native row/token_mean/step_row/"
-                                "step_local/off trajectory_grpo is supported"
-                            )
                         batch = compute_advantage(
                             batch,
                             adv_estimator=self.config.algorithm.adv_estimator,
@@ -1340,6 +1342,10 @@ class RayPPOTrainer:
                             gigpo_mode=self.config.algorithm.gigpo.mode,
                             gigpo_enable_similarity= self.config.algorithm.gigpo.enable_similarity,
                             gigpo_similarity_thresh=self.config.algorithm.gigpo.similarity_thresh,
+                        )
+                        batch = self._postprocess_advantages(
+                            batch,
+                            metrics,
                         )
 
                     # update critic
