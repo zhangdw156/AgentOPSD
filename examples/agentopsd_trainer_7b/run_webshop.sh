@@ -44,7 +44,7 @@ MODEL_ARGS=(
 ACTOR_ARGS=(
     "actor_rollout_ref.actor.optim.lr=1e-6" "actor_rollout_ref.actor.strategy=fsdp"
     "actor_rollout_ref.actor.ppo_epochs=1" "actor_rollout_ref.actor.ppo_mini_batch_size=64"
-    "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=8"
+    "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=4"
     "actor_rollout_ref.actor.use_dynamic_bsz=False" "actor_rollout_ref.actor.shuffle=False"
     "actor_rollout_ref.actor.ulysses_sequence_parallel_size=1"
     "actor_rollout_ref.actor.loss_agg_mode=token-mean"
@@ -69,7 +69,7 @@ ROLLOUT_ARGS=(
     "actor_rollout_ref.rollout.val_kwargs.n=1"
 )
 REFERENCE_ARGS=(
-    "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=8"
+    "actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=4"
     "actor_rollout_ref.ref.fsdp_config.param_offload=True"
 )
 REWARD_ARGS=("reward_model.enable=False" "reward_model.reward_manager=episode")

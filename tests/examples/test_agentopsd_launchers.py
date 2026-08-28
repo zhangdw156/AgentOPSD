@@ -191,12 +191,12 @@ def test_launchers_match_the_fair_comparison_contract():
         }[benchmark]
 
         memory_contract = {
-            ("1.5b", "alfworld"): ("64", "32", "64", "0.6", "False"),
-            ("3b", "alfworld"): ("32", "16", "32", "0.6", "False"),
-            ("7b", "alfworld"): ("8", "4", "8", "0.45", "True"),
-            ("1.5b", "webshop"): ("16", "16", "32", "0.6", "False"),
-            ("3b", "webshop"): ("8", "8", "16", "0.6", "False"),
-            ("7b", "webshop"): ("8", "4", "8", "0.45", "True"),
+            ("1.5b", "alfworld"): ("32", "32", "32", "0.6", "False"),
+            ("3b", "alfworld"): ("16", "16", "16", "0.6", "False"),
+            ("7b", "alfworld"): ("4", "4", "4", "0.45", "True"),
+            ("1.5b", "webshop"): ("8", "16", "16", "0.6", "False"),
+            ("3b", "webshop"): ("4", "8", "8", "0.6", "False"),
+            ("7b", "webshop"): ("4", "4", "4", "0.45", "True"),
         }[(size, benchmark)]
         assert effective[
             "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu"
