@@ -206,6 +206,7 @@ class RLSDRayTrainer(RayPPOTrainer):
             pprint(f"Initial validation metrics: {val_metrics}")
             logger.log(data=val_metrics, step=self.global_steps)
             if self.config.trainer.get("val_only", False):
+                logger.close()
                 return
 
         progress_bar = tqdm(total=self.total_training_steps, initial=self.global_steps, desc="RLSD Training")
@@ -417,7 +418,11 @@ class RLSDRayTrainer(RayPPOTrainer):
                 if is_last_step:
                     pprint(f"Final validation metrics: {last_val_metrics}")
                     progress_bar.close()
+                    logger.close()
                     return
+
+        # Safety net: epoch loop finished without reaching total_training_steps.
+        logger.close()
 
     def _compute_teacher_log_probs(self, batch: DataProto) -> torch.Tensor:
         """
